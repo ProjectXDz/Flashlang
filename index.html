@@ -763,6 +763,7 @@ let isFlipped = false;
 let isDone = false;
 let recognition = null;
 let isRecording = false;
+let recognitionReady = false;
 
 // ===== TIMER STATE =====
 let timerEnabled = false;
@@ -1014,11 +1015,19 @@ function setLang(lang) {
   });
   // show JLPT level only for Japanese
   document.getElementById('levelSelect').style.display = lang === 'ja' ? '' : 'none';
-
-  deck = shuffle([...decks[lang]]);
+  // API-first boot: do not render/speak built-in card before API returns.
+  deck = [];
   idx = 0; correct = 0; wrong = 0; streak = 0; isDone = false;
   updateStats();
-  loadCard();
+  updateProgress();
+  document.getElementById('frontText').textContent = 'กำลังโหลด...';
+  document.getElementById('frontText').className = 'main-text small';
+  document.getElementById('frontRoman').textContent = 'loading';
+  document.getElementById('backMeaning').textContent = '–';
+  document.getElementById('backExample').textContent = '';
+  document.getElementById('voiceText').textContent = '–';
+  document.getElementById('scoreBadge').innerHTML = '';
+  document.getElementById('cardInner').classList.remove('flipped');
   stopRecording();
   restartTimer();
   generateDeck();
@@ -1190,19 +1199,43 @@ function setupRecognition() {
   }
   const rec = new SpeechRecognition();
   rec.continuous = false;
-  rec.interimResults = false;
-  rec.maxAlternatives = 3;
+  rec.interimResults = true;
+  rec.maxAlternatives = 5;
 
   rec.onresult = (e) => {
-    const heard = e.results[0][0].transcript.trim();
+    const result = e.results[e.resultIndex];
+    if (!result) return;
+    const bestAlt = pickBestAlternative(result);
+    const heard = (bestAlt.transcript || '').trim();
+    const confidence = Number.isFinite(bestAlt.confidence) ? bestAlt.confidence : null;
+
     document.getElementById('voiceText').textContent = heard || '–';
-    checkPronunciation(heard);
+    if (result.isFinal && heard) {
+      checkPronunciation(heard, confidence);
+    }
+  };
+
+  rec.onerror = (e) => {
+    const messageMap = {
+      'no-speech': 'ไม่ได้ยินเสียง ลองพูดใกล้ไมค์อีกครั้ง',
+      'audio-capture': 'ไม่พบไมโครโฟน',
+      'not-allowed': 'ยังไม่ได้อนุญาตไมโครโฟน',
+      'network': 'เครือข่ายมีปัญหา ลองใหม่อีกครั้ง',
+      'aborted': 'หยุดการฟังแล้ว'
+    };
+    const msg = messageMap[e.error] || `เกิดข้อผิดพลาด: ${e.error || 'unknown'}`;
+    document.getElementById('voiceText').textContent = msg;
     isRecording = false;
     document.getElementById('micBtn').classList.remove('recording');
-    document.getElementById('micBtn').textContent = '🎙️';
+    document.getElementById('micBtn').textContent='🎙️';
   };
-  rec.onerror = () => { isRecording=false; document.getElementById('micBtn').classList.remove('recording'); document.getElementById('micBtn').textContent='🎙️'; };
-  rec.onend   = () => { isRecording=false; document.getElementById('micBtn').classList.remove('recording'); document.getElementById('micBtn').textContent='🎙️'; };
+
+  rec.onend = () => {
+    isRecording = false;
+    document.getElementById('micBtn').classList.remove('recording');
+    document.getElementById('micBtn').textContent='🎙️';
+  };
+  recognitionReady = true;
   return rec;
 }
 
@@ -1213,7 +1246,12 @@ function toggleRecording() {
     stopRecording();
   } else {
     recognition.lang = langCodes[currentLang];
-    recognition.start();
+    try {
+      recognition.start();
+    } catch (e) {
+      document.getElementById('voiceText').textContent = 'เริ่มฟังไม่สำเร็จ ลองใหม่';
+      return;
+    }
     isRecording = true;
     document.getElementById('micBtn').classList.add('recording');
     document.getElementById('micBtn').textContent = '⏹';
@@ -1229,17 +1267,47 @@ function stopRecording() {
   document.getElementById('micBtn').textContent = '🎙️';
 }
 
-function checkPronunciation(heard) {
+function normalizeSpokenText(text) {
+  if (!text) return '';
+  // Normalize width/compatibility and remove common punctuation/spacing.
+  let normalized = text.normalize('NFKC').toLowerCase();
+  normalized = normalized
+    .replace(/[ー〜～\-\s。、，,.!?！？・"'`]/g, '')
+    .replace(/[（）()\[\]「」『』]/g, '');
+  // Convert Katakana to Hiragana for stable JA comparisons.
+  normalized = normalized.replace(/[\u30a1-\u30f6]/g, ch =>
+    String.fromCharCode(ch.charCodeAt(0) - 0x60)
+  );
+  return normalized;
+}
+
+function pickBestAlternative(result) {
+  if (!result || !result.length) return { transcript: '', confidence: null };
+  let best = result[0];
+  for (let i = 1; i < result.length; i++) {
+    if ((result[i].confidence || 0) > (best.confidence || 0)) best = result[i];
+  }
+  return best;
+}
+
+function checkPronunciation(heard, confidence = null) {
   if(isDone || idx >= deck.length) return;
-  const target = deck[idx].front.replace(/\s/g,'').toLowerCase();
-  const heardClean = heard.replace(/\s/g,'').toLowerCase();
+  const target = normalizeSpokenText(deck[idx].front);
+  const heardClean = normalizeSpokenText(heard);
   const badge = document.getElementById('scoreBadge');
+  if(!heardClean) {
+    badge.innerHTML = '<span class="score-badge score-wrong">✗ ไม่ได้ยินชัด ลองใหม่</span>';
+    return;
+  }
+
   if(heardClean === target) {
     badge.innerHTML = '<span class="score-badge score-correct">✓ ถูกต้อง! ยอดเยี่ยม</span>';
   } else {
     const sim = similarity(heardClean, target);
-    if(sim >= 0.6) badge.innerHTML = `<span class="score-badge score-close">~ เกือบถูก! (${Math.round(sim*100)}%)</span>`;
-    else           badge.innerHTML = `<span class="score-badge score-wrong">✗ ลองใหม่ (${Math.round(sim*100)}%)</span>`;
+    const confidencePenalty = (confidence !== null && confidence < 0.45) ? 0.07 : 0;
+    const adjusted = Math.max(0, sim - confidencePenalty);
+    if(adjusted >= 0.7) badge.innerHTML = `<span class="score-badge score-close">~ เกือบถูก! (${Math.round(adjusted*100)}%)</span>`;
+    else                badge.innerHTML = `<span class="score-badge score-wrong">✗ ลองใหม่ (${Math.round(adjusted*100)}%)</span>`;
   }
 }
 
