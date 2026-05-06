@@ -534,6 +534,18 @@
     animation: pulse 0.8s infinite;
   }
 
+  .front-example {
+    font-family: 'Noto Sans KR', sans-serif;
+    font-size: 12px;
+    color: var(--muted);
+    text-align: center;
+    margin-top: 10px;
+    line-height: 1.6;
+    white-space: pre-line;
+    max-width: 90%;
+    opacity: 0.85;
+  }
+
   /* TOPIC SELECTOR */
   .topic-bar {
     width: 100%;
@@ -606,9 +618,9 @@
 <header>
   <div class="logo">⚡ FLASHLANG</div>
   <div class="lang-selector">
-    <button class="lang-btn" disabled title="Disabled for API testing">🇰🇷 KO</button>
-    <button class="lang-btn active" onclick="setLang('ja')">🇯🇵 JA</button>
-    <button class="lang-btn" disabled title="Disabled for API testing">🇨🇳 ZH</button>
+    <button class="lang-btn active" onclick="setLang('ko')">🇰🇷 KO</button>
+    <button class="lang-btn" onclick="setLang('ja')">🇯🇵 JA</button>
+    <button class="lang-btn" onclick="setLang('zh')">🇨🇳 ZH</button>
   </div>
 </header>
 
@@ -651,6 +663,7 @@
       <div class="card-tag">แตะเพื่อพลิก</div>
       <div class="main-text" id="frontText">안녕하세요</div>
       <div class="romanize" id="frontRoman">an-nyeong-ha-se-yo</div>
+      <div class="front-example" id="frontExample"></div>
       <button class="speak-btn" id="speakBtn" onclick="event.stopPropagation(); speakWord()" title="ฟังเสียงออกเสียง">🔊</button>
       <div class="card-hint">👆 tap to reveal</div>
     </div>
@@ -755,7 +768,7 @@ const decks = {
 
 const langCodes = { ko:"ko-KR", ja:"ja-JP", zh:"zh-CN" };
 
-let currentLang = 'ja';
+let currentLang = 'ko';
 let deck = [];
 let idx = 0;
 let correct = 0, wrong = 0, streak = 0;
@@ -764,6 +777,8 @@ let isDone = false;
 let recognition = null;
 let isRecording = false;
 let recognitionReady = false;
+let isDeckLoading = false;
+let speakTimeout = null;
 
 // ===== TIMER STATE =====
 let timerEnabled = false;
@@ -775,6 +790,28 @@ let timerPhase = 'front'; // 'front' -> flip -> 'back' -> next
 
 // ===== TTS =====
 const ttsLang = { ko:'ko-KR', ja:'ja-JP', zh:'zh-TW' };
+let pendingVoiceRetry = null;
+
+function pickPreferredVoice(lang) {
+  const voices = speechSynthesis.getVoices() || [];
+  if (!voices.length) return null;
+
+  const prefix = lang.slice(0, 2);
+  const langExact = voices.filter(v => v.lang === lang);
+  const langPrefix = voices.filter(v => v.lang && v.lang.startsWith(prefix));
+  const pool = langExact.length ? langExact : langPrefix;
+  if (!pool.length) return null;
+
+  // Prefer native/local Korean voices to avoid robotic cross-language pronunciation.
+  if (lang === 'ko-KR') {
+    const preferredName = /(korean|한국|heami|sunhi|google 한국어|microsoft.*korean)/i;
+    const byName = pool.find(v => preferredName.test(v.name));
+    if (byName) return byName;
+  }
+
+  const local = pool.find(v => v.localService);
+  return local || pool[0];
+}
 
 function speakWord() {
   if(isDone || idx >= deck.length) return;
@@ -785,12 +822,21 @@ function speakWord() {
   window.speechSynthesis.cancel();
   const utt = new SpeechSynthesisUtterance(text);
   utt.lang = lang;
-  utt.rate = 0.85;
+  // Korean often sounds clearer slightly slower.
+  utt.rate = currentLang === 'ko' ? 0.76 : 0.85;
+  utt.pitch = currentLang === 'ko' ? 1.0 : 1.02;
 
   // pick best matching voice if available
-  const voices = speechSynthesis.getVoices();
-  const match = voices.find(v => v.lang.startsWith(lang.slice(0,2)));
-  if(match) utt.voice = match;
+  const match = pickPreferredVoice(lang);
+  if(match) {
+    utt.voice = match;
+  } else if (!pendingVoiceRetry) {
+    // Some browsers load voices asynchronously; retry once quickly.
+    pendingVoiceRetry = setTimeout(() => {
+      pendingVoiceRetry = null;
+      if (!isDone && idx < deck.length) speakWord();
+    }, 180);
+  }
 
   utt.onstart  = () => { btn.classList.add('speaking'); btn.textContent = '🔉'; };
   utt.onend    = () => { btn.classList.remove('speaking'); btn.textContent = '🔊'; };
@@ -799,8 +845,39 @@ function speakWord() {
   speechSynthesis.speak(utt);
 }
 
-// voices load async on some browsers
-speechSynthesis.onvoiceschanged = () => {};
+// voices load async on some browsers — fire pending speak once ready
+let voicesReady = false;
+let pendingSpeakOnReady = false;
+
+function ensureVoicesReady(callback) {
+  const voices = speechSynthesis.getVoices();
+  if (voices && voices.length > 0) {
+    voicesReady = true;
+    callback();
+  } else {
+    pendingSpeakOnReady = true;
+    speechSynthesis.onvoiceschanged = () => {
+      if (voicesReady) return;
+      voicesReady = true;
+      speechSynthesis.onvoiceschanged = null;
+      if (pendingSpeakOnReady) {
+        pendingSpeakOnReady = false;
+        callback();
+      }
+    };
+  }
+}
+
+speechSynthesis.onvoiceschanged = () => {
+  if (!voicesReady) {
+    voicesReady = true;
+    if (pendingSpeakOnReady) {
+      pendingSpeakOnReady = false;
+      // speak the current card if still on same card
+      if (!isDone && deck.length > 0 && idx < deck.length) speakWord();
+    }
+  }
+};
 
 // ===== FREE API — GENERATE DECK =====
 // Japanese  → jlpt-vocab-api.vercel.app  (N1-N5, ฟรี ไม่ต้อง key)
@@ -902,7 +979,12 @@ const zhPool = [
   {front:"喜欢",roman:"xǐ huān",meaning:"ชอบ",example:"我喜欢泰国菜。\n(ผมชอบอาหารไทยครับ)"},
 ];
 
+let _deckToken = 0; // increments on every setLang call; async fetch checks before applyDeck
+
 async function generateDeck() {
+  const myToken = _deckToken;          // capture token at call time
+  const myLang  = currentLang;         // capture lang at call time
+
   const btn = document.getElementById('genBtn');
   const bar = document.getElementById('loadingBar');
   const level = parseInt(document.getElementById('levelSelect').value);
@@ -910,41 +992,48 @@ async function generateDeck() {
   bar.classList.add('show');
 
   try {
-    if (currentLang === 'ja') {
-      // ── Japanese: JLPT Vocab API (free, no key) ──
+    let cards = [];
+
+    if (myLang === 'ja') {
+      isDeckLoading = true;
       document.getElementById('loadingText').textContent = `กำลังโหลด JLPT N${level}…`;
       const total = await fetchJLPTTotal(level);
-      const cards = await fetchJLPTRandom(level, total, 20);
+      // bail out if user already switched language
+      if (myToken !== _deckToken) return;
+      cards = await fetchJLPTRandom(level, total, 20);
+      if (myToken !== _deckToken) return;
       if (!cards.length) throw new Error('JLPT API returned 0 words');
-      applyDeck(cards);
+      isDeckLoading = false;
 
-    } else if (currentLang === 'ko') {
-      // ── Korean: shuffle built-in pool (offline, instant) ──
+    } else if (myLang === 'ko') {
       document.getElementById('loadingText').textContent = 'กำลังสุ่มคำศัพท์เกาหลี…';
-      const cards = shuffle([...koPool]).slice(0, 20);
-      applyDeck(cards);
+      cards = shuffle([...koPool]).slice(0, 20);
 
     } else {
-      // ── Chinese: shuffle built-in pool (offline, instant) ──
       document.getElementById('loadingText').textContent = 'กำลังสุ่มคำศัพท์จีน…';
-      const cards = shuffle([...zhPool]).slice(0, 20);
-      applyDeck(cards);
+      cards = shuffle([...zhPool]).slice(0, 20);
     }
+
+    // final guard — language may have changed while awaiting
+    if (myToken !== _deckToken) return;
+    applyDeck(cards, myLang);
+
   } catch(e) {
+    if (myToken !== _deckToken) return;   // discard stale error
     console.error(e);
-    // For Japanese API testing: do not silently fallback to built-in words
-    if (currentLang === 'ja') {
+    if (myLang === 'ja') {
+      isDeckLoading = false;
       const msg = (e && e.message) ? e.message : 'unknown error';
       document.getElementById('loadingText').textContent = `❌ API error: ${msg}`;
       return;
     }
     document.getElementById('loadingText').textContent = '❌ โหลดไม่ได้ ใช้คำศัพท์สำรอง';
-    const fallback = shuffle([...decks[currentLang]]).slice(0, 20);
-    applyDeck(fallback);
+    const fallback = shuffle([...decks[myLang]]).slice(0, 20);
+    applyDeck(fallback, myLang);
     setTimeout(()=>bar.classList.remove('show'), 2000);
   } finally {
     btn.disabled = false;
-    if (currentLang !== 'ja' || document.getElementById('loadingText').textContent.indexOf('API error:') === -1) {
+    if (myLang !== 'ja' || (document.getElementById('loadingText').textContent.indexOf('API error:') === -1)) {
       bar.classList.remove('show');
     }
   }
@@ -997,9 +1086,11 @@ async function fetchJLPTRandom(level, total, count) {
   })).filter(w => w.front);
 }
 
-function applyDeck(cards) {
+function applyDeck(cards, lang) {
   if (!cards || cards.length === 0) throw new Error('empty');
-  decks[currentLang] = cards;
+  const target = lang || currentLang;
+  decks[target] = cards;
+  if (target !== currentLang) return; // user switched away, discard
   deck = shuffle([...cards]);
   idx = 0; correct = 0; wrong = 0; streak = 0; isDone = false;
   updateStats();
@@ -1008,29 +1099,49 @@ function applyDeck(cards) {
 }
 // ===== INIT =====
 function setLang(lang) {
-  if (lang !== 'ja') return;
+  // cancel any in-flight async generateDeck from previous lang
+  _deckToken++;
+
+  // stop any pending auto-speak from previous card
+  if (speakTimeout) { clearTimeout(speakTimeout); speakTimeout = null; }
+  window.speechSynthesis.cancel();
+
   currentLang = lang;
   document.querySelectorAll('.lang-btn').forEach((b,i)=>{
     b.classList.toggle('active', ['ko','ja','zh'][i]===lang);
   });
   // show JLPT level only for Japanese
   document.getElementById('levelSelect').style.display = lang === 'ja' ? '' : 'none';
-  // API-first boot: do not render/speak built-in card before API returns.
-  deck = [];
-  idx = 0; correct = 0; wrong = 0; streak = 0; isDone = false;
-  updateStats();
-  updateProgress();
-  document.getElementById('frontText').textContent = 'กำลังโหลด...';
-  document.getElementById('frontText').className = 'main-text small';
-  document.getElementById('frontRoman').textContent = 'loading';
-  document.getElementById('backMeaning').textContent = '–';
-  document.getElementById('backExample').textContent = '';
-  document.getElementById('voiceText').textContent = '–';
-  document.getElementById('scoreBadge').innerHTML = '';
-  document.getElementById('cardInner').classList.remove('flipped');
+
   stopRecording();
   restartTimer();
-  generateDeck();
+
+  if (lang === 'ja') {
+    // API-first: do not render/speak built-in card before API returns
+    isDeckLoading = true;
+    deck = [];
+    idx = 0; correct = 0; wrong = 0; streak = 0; isDone = false;
+    updateStats();
+    updateProgress();
+    document.getElementById('frontText').textContent = 'กำลังโหลด...';
+    document.getElementById('frontText').className = 'main-text small';
+    document.getElementById('frontRoman').textContent = 'loading from JLPT API';
+    document.getElementById('frontExample').textContent = '';
+    document.getElementById('backMeaning').textContent = '–';
+    document.getElementById('backExample').textContent = '';
+    document.getElementById('voiceText').textContent = '–';
+    document.getElementById('scoreBadge').innerHTML = '';
+    document.getElementById('cardInner').classList.remove('flipped');
+    generateDeck();
+    return;
+  }
+
+  // KO / ZH
+  isDeckLoading = false;
+  deck = shuffle([...decks[lang]]);
+  idx = 0; correct = 0; wrong = 0; streak = 0; isDone = false;
+  updateStats();
+  loadCard();
 }
 
 function shuffle(arr) {
@@ -1055,14 +1166,13 @@ function loadCard() {
   document.getElementById('frontText').textContent = card.front;
   document.getElementById('frontText').className = 'main-text' + (card.front.length > 5 ? ' small' : '');
   document.getElementById('frontRoman').textContent = card.roman;
+  document.getElementById('frontExample').textContent = card.example || '';
   document.getElementById('backMeaning').textContent = card.meaning;
   document.getElementById('backExample').textContent = card.example || '';
   document.getElementById('voiceText').textContent = '–';
   document.getElementById('scoreBadge').innerHTML = '';
   updateProgress();
   if(timerEnabled) startTimerCycle();
-  // auto-speak after short delay so card animation settles
-  setTimeout(speakWord, 400);
 }
 
 function showDoneScreen() {
@@ -1333,7 +1443,7 @@ function editDistance(a,b) {
 }
 
 // ===== START =====
-setLang('ja');
+setLang('ko');
 </script>
 </body>
 </html>
